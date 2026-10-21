@@ -63,7 +63,7 @@ done
 
 echo "====== Altair Framework: Starting Standalone System (Single PC) ======"
 
-# 1. 実行ファイル存在チェック & ビルド
+# 1. 実行ファイル存在チェック & ソース更新検知による自動ビルド
 SHOULD_BUILD=0
 if [ ! -f "install/setup.bash" ]; then
     SHOULD_BUILD=1
@@ -72,6 +72,10 @@ elif [ ! -f "install/altair_core/lib/altair_core/module_manager" ] || [ ! -f "in
 elif [ "$USE_USB" -eq 1 ] && [ ! -f "install/altair_can_bridge/lib/altair_can_bridge/can_bridge_node" ]; then
     SHOULD_BUILD=1
 elif [ "$USE_USB" -eq 0 ] && [ ! -f "install/altair_eth_can_bridge/lib/altair_eth_can_bridge/eth_can_bridge_node" ]; then
+    SHOULD_BUILD=1
+elif [ "$USE_USB" -eq 0 ] && [ "altair_eth_can_bridge/src/eth_can_bridge_node.cpp" -nt "install/altair_eth_can_bridge/lib/altair_eth_can_bridge/eth_can_bridge_node" ]; then
+    SHOULD_BUILD=1
+elif [ "$USE_USB" -eq 1 ] && [ "altair_can_bridge/src/can_bridge_node.cpp" -nt "install/altair_can_bridge/lib/altair_can_bridge/can_bridge_node" ]; then
     SHOULD_BUILD=1
 fi
 

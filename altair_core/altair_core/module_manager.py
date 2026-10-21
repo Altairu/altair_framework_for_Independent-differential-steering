@@ -1,6 +1,7 @@
 import json
 import os
 import struct
+import time
 from pathlib import Path
 import rclpy
 from rclpy.node import Node
@@ -60,13 +61,17 @@ class ModuleManager(Node):
 
         # 制御システムの状態 (False = パラメータ送信待ち, True = 制御実行中)
         self.is_running = False
+        # パラメータ送信中フラグ（パラメータ送信中に周期コマンドが割り込むのを防ぐ）
+        self.is_sending_params = False
+        # 制御開始時刻（モード遷移直後の古いキャッシュや遷移中の0x230フレームによる誤リセットを防ぐ猶予期間用）
+        self.control_start_monotonic = 0.0
 
         # 設定ファイルのロードと動的初期化
         self.load_config_and_initialize()
 
-        # 2ms周期のCANコマンド送信タイマー (500Hz)
+        # 10ms周期のCANコマンド送信タイマー (100Hz: マイコンの制御周期およびEthernet-CANの1msポーリングに適合)
         self.control_timer = self.create_timer(
-            0.002, self.publish_all_control_commands,
+            0.01, self.publish_all_control_commands,
             callback_group=self.callback_group
         )
 
@@ -210,21 +215,25 @@ class ModuleManager(Node):
             self.solenoid_valves[name] = [bool(v) for v in msg.valves]
         return callback
 
-    # --- 2. 2ms周期 CANコマンド一括送信タイマー (500Hz) ---
+    # --- 2. 10ms周期 CANコマンド一括送信タイマー (100Hz) ---
     def publish_all_control_commands(self):
         """
-        登録されているすべてのモジュールに対して、最新の指令値を2ms（500Hz）周期で常にCANバスへ送信する
+        登録されているすべてのモジュールに対して、最新の指令値を10ms（100Hz）周期でCANバスへ送信する
         """
+        # パラメータ送信中は設定フレームの上書きを防ぐため周期送信を一時停止する
+        if self.is_sending_params:
+            return
+
         for module in self.config.get('modules', []):
             name = module['name']
             mtype = module['type']
             base_id = int(module['base_id'], 16)
 
             if mtype == 'mdd':
-                # 制御中でない（SETUP状態）ときは、安全のために強制的に [0.0, 0.0, 0.0, 0.0] のゼロ指令を送り続ける
-                targets = self.mdd_targets.get(name, [0.0, 0.0, 0.0, 0.0])
+                # 制御実行中(is_running == True)でないときは、不要なバス負荷と上書きを避けるため0x220を送信しない
                 if not self.is_running:
-                    targets = [0.0, 0.0, 0.0, 0.0]
+                    continue
+                targets = self.mdd_targets.get(name, [0.0, 0.0, 0.0, 0.0])
 
                 cmd_id = base_id + 0x20  # 例: 0x220
                 try:
@@ -297,10 +306,16 @@ class ModuleManager(Node):
                     # アンパック (Limit SW1-4, Error Code, System Status)
                     cache['limit_switches'] = [bool(b) for b in data[0:4]]
                     cache['error_code'] = data[4]
-                    cache['system_status'] = data[5]
+
+                    in_grace_period = (time.monotonic() - self.control_start_monotonic) < 1.2
+                    if data[5] == 0 and self.is_running and in_grace_period:
+                        # 制御開始直後の遷移猶予期間中は、古い待機ステータス(0)による誤リセットを防ぐ
+                        cache['system_status'] = 1
+                    else:
+                        cache['system_status'] = data[5]
                     
                     # マイコンが待機状態（0）にリセットされたことを検知したら、PC側の制御フラグも安全のために即座にFalseに戻す
-                    if data[5] == 0 and self.is_running:
+                    if data[5] == 0 and self.is_running and not in_grace_period:
                         self.is_running = False
                         module_name = ""
                         for module in self.config.get('modules', []):
@@ -368,6 +383,7 @@ class ModuleManager(Node):
         _ = request
         self.get_logger().info("スタート制御要求を受信しました。パラメータの送信を開始します。")
 
+        self.is_sending_params = True
         try:
             # 構成ファイル内のすべてのmddモジュールに対してパラメータを順次送信
             for module in self.config.get('modules', []):
@@ -402,14 +418,17 @@ class ModuleManager(Node):
                     motor_id = base_id + idx
                     
                     frame = Frame()
+                    frame.header.stamp = self.get_clock().now().to_msg()
                     frame.id = motor_id
                     frame.dlc = 8
+                    frame.is_extended = False
+                    frame.is_rtr = False
                     frame.data = list(payload)
                     self.can_tx_pub.publish(frame)
                     
                     self.get_logger().info(f"パラメータ送信: モータ{idx+1} (ID:{hex(motor_id)}) P={p_gain}, I={i_gain}, D={d_gain}, 車輪={diameter_dir}")
-                    # マイコン側の受信バッファ溢れを防ぐため微小な遅延を挟む
-                    os.system("sleep 0.02")
+                    # Ethernet-CANおよびマイコン側の受信バッファ溢れを防ぐため遅延を挟む
+                    time.sleep(0.025)
 
                 # 4ch モード設定 (0x210) の送信
                 modes = [
@@ -423,14 +442,23 @@ class ModuleManager(Node):
                 mode_payload = modes + [0]*4
                 
                 mode_frame = Frame()
+                mode_frame.header.stamp = self.get_clock().now().to_msg()
                 mode_frame.id = base_id + 0x10  # 例: 0x210
                 mode_frame.dlc = 4
+                mode_frame.is_extended = False
+                mode_frame.is_rtr = False
                 mode_frame.data = mode_payload
                 self.can_tx_pub.publish(mode_frame)
                 
                 self.get_logger().info(f"モード設定送信 (ID:{hex(base_id + 0x10)}): モード={modes}")
+                time.sleep(0.025)
 
-            # 制御実行中フラグをONにする
+                # キャッシュ上のsystem_statusも一旦1（制御実行中）に更新して、直後の0x240/0x250受信で古い0が配信されるのを防ぐ
+                if base_id in self.mdd_feedback_cache:
+                    self.mdd_feedback_cache[base_id]['system_status'] = 1
+
+            # 制御開始時刻を記録して制御実行中フラグをONにする
+            self.control_start_monotonic = time.monotonic()
             self.is_running = True
             response.success = True
             response.message = "パラメータが正常に送信され、制御システムが実行状態に遷移しました。"
@@ -441,6 +469,8 @@ class ModuleManager(Node):
             response.success = False
             response.message = f"パラメータ送信中にエラーが発生しました: {str(e)}"
             self.get_logger().error(f"パラメータ送信エラー: {str(e)}")
+        finally:
+            self.is_sending_params = False
 
         return response
 

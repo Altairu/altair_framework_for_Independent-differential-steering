@@ -14,6 +14,7 @@ document.addEventListener("DOMContentLoaded", () => {
     canConnected: false,
     behaviorStatus: "IDLE",
     controlMode: "SETUP", // SETUP (送信待ち), CONTROL (制御中)
+    controlStartTimeMs: 0, // パラメータ送信直後の古いテレメトリによる誤リセット防止用タイムスタンプ
     moduleSendToggles: {}, // 各モジュールへのUI指令値の送信ON/OFFトグル状態
     gamepadMappings: [], // コントローラーのマッピングデータ
   };
@@ -854,7 +855,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // マイコン側のモード判定による自動リセット検知
     if (typeof data.system_status !== 'undefined') {
-      if (data.system_status === 0 && state.controlMode === "CONTROL") {
+      const inGracePeriod = (Date.now() - (state.controlStartTimeMs || 0)) < 1500;
+      if (data.system_status === 1 && state.controlMode !== "CONTROL") {
+        state.controlMode = "CONTROL";
+        if (el.lblControlModeStatus) {
+          el.lblControlModeStatus.innerHTML = 'ステータス: <span class="badge badge-success">制御実行中 (Control Mode)</span>';
+        }
+      } else if (data.system_status === 0 && state.controlMode === "CONTROL" && !inGracePeriod) {
         state.controlMode = "SETUP";
         if (el.lblControlModeStatus) {
           el.lblControlModeStatus.innerHTML = 'ステータス: <span class="badge badge-warning">パラメータ未送信 (待機中)</span>';
@@ -1002,6 +1009,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const data = await res.json();
 
       if (data.success) {
+        state.controlStartTimeMs = Date.now();
         appendTerminalLog(el.behaviorTerminal, "[SYSTEM] パラメータ送信成功。制御実行状態になりました！", "system-msg");
         el.lblControlModeStatus.innerHTML = 'ステータス: <span class="badge badge-success">制御実行中 (Control Mode)</span>';
         state.controlMode = "CONTROL";

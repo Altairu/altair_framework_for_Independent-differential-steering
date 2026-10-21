@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <deque>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -39,10 +40,19 @@ public:
     this->declare_parameter<std::string>("target_ip", "192.168.2.123");
     this->declare_parameter<int>("target_port", 5000);
     this->declare_parameter<std::string>("can_channel", "can1");
+    this->declare_parameter<double>("poll_interval_ms", 5.0);
+    this->declare_parameter<double>("poll_suppress_after_tx_ms", 15.0);
+    this->declare_parameter<int>("config_frame_repeat", 3);
 
     target_ip_ = this->get_parameter("target_ip").as_string();
     target_port_ = this->get_parameter("target_port").as_int();
     can_channel_ = this->get_parameter("can_channel").as_string();
+    poll_interval_ms_ = this->get_parameter("poll_interval_ms").as_double();
+    poll_suppress_after_tx_ms_ = this->get_parameter("poll_suppress_after_tx_ms").as_double();
+    config_frame_repeat_ = this->get_parameter("config_frame_repeat").as_int();
+    if (config_frame_repeat_ < 1) {
+      config_frame_repeat_ = 1;
+    }
 
     RCLCPP_INFO(this->get_logger(), "Altair Ethernet-CAN Bridge ノードを初期化しています...");
     RCLCPP_INFO(this->get_logger(), "接続先: %s:%d, 対象チャンネル: %s",
@@ -69,9 +79,9 @@ public:
     status_timer_ = this->create_wall_timer(
       1000ms, std::bind(&EthCanBridgeNode::publish_status, this));
 
-    // 受信スレッドの開始
-    rx_thread_running_ = true;
-    rx_thread_ = std::thread(&EthCanBridgeNode::rx_thread_loop, this);
+    // 送受信統合スレッドの開始
+    io_thread_running_ = true;
+    io_thread_ = std::thread(&EthCanBridgeNode::io_thread_loop, this);
 
     // 自動接続・再接続スレッドの開始
     auto_connect_running_ = true;
@@ -87,32 +97,51 @@ public:
       auto_connect_thread_.join();
     }
 
-    rx_thread_running_ = false;
-    if (rx_thread_.joinable()) {
-      rx_thread_.join();
+    io_thread_running_ = false;
+    if (io_thread_.joinable()) {
+      io_thread_.join();
     }
 
     close_socket();
   }
 
 private:
-  // --- 1. ROS2トピック ➔ Ethernet-CAN (TX) ---
+  // 送信キュー要素
+  struct PendingTxItem
+  {
+    uint16_t can_id;
+    bool send_to_can2;
+    bool is_config_frame;
+    uint8_t payload[20];
+  };
+
+  // パラメータ設定 (0x200..0x203) やモード設定 (0x210) など、取りこぼし厳禁の設定用フレームかどうかを判定
+  static bool is_config_can_id(uint16_t can_id)
+  {
+    uint16_t sub_id = can_id & 0x0FF;
+    // MDD Base ID (例: 0x200, 0x400) に対する +0x00..+0x1F を設定フレームとして扱う
+    return (can_id >= 0x200) && (sub_id < 0x20);
+  }
+
+  // --- 1. ROS2トピック ➔ 送信キュー登録 (TX) ---
   void handle_can_tx_callback(const can_msgs::msg::Frame::SharedPtr msg)
   {
-    std::lock_guard<std::mutex> lock(socket_mutex_);
-    if (!is_connected_ || sock_ < 0) {
+    if (!is_connected_) {
       return;
     }
 
     // Analyzer Mode 送信パケット構造 (20バイト)
-    // 0..1:   CAN1 ID
+    // 0..1:   CAN1 ID (11bit標準IDをBig-Endian格納)
     // 2..9:   CAN1 Data (8バイト)
-    // 10..11: CAN2 ID
+    // 10..11: CAN2 ID (11bit標準IDをBig-Endian格納)
     // 12..19: CAN2 Data (8バイト)
-    uint8_t payload[20];
-    std::memset(payload, 0, sizeof(payload));
+    PendingTxItem item{};
+    std::memset(item.payload, 0, sizeof(item.payload));
 
     uint16_t standard_id = static_cast<uint16_t>(msg->id & 0x7FF);
+    if (standard_id == 0) {
+      return;
+    }
     uint8_t dlc = msg->dlc > 8 ? 8 : msg->dlc;
 
     bool send_to_can2 = false;
@@ -123,33 +152,70 @@ private:
     }
 
     size_t base_offset = send_to_can2 ? 10 : 0;
-    payload[base_offset]     = (standard_id >> 8) & 0xFF;
-    payload[base_offset + 1] = standard_id & 0xFF;
+    item.payload[base_offset]     = static_cast<uint8_t>((standard_id >> 8) & 0xFF);
+    item.payload[base_offset + 1] = static_cast<uint8_t>(standard_id & 0xFF);
     for (size_t i = 0; i < dlc; ++i) {
-      payload[base_offset + 2 + i] = msg->data[i];
+      item.payload[base_offset + 2 + i] = msg->data[i];
     }
 
-    // ソケットへ即時送信
-    ssize_t bytes_sent = send(sock_, payload, sizeof(payload), MSG_NOSIGNAL);
-    if (bytes_sent < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-          "TCP送信バッファ満杯のためパケットをスキップしました。");
-        return;
+    item.can_id = standard_id;
+    item.send_to_can2 = send_to_can2;
+    item.is_config_frame = is_config_can_id(standard_id);
+
+    std::lock_guard<std::mutex> lock(tx_queue_mutex_);
+    if (item.is_config_frame) {
+      // 設定フレーム (0x200..0x203, 0x210) はSTM32側の1msタイマーで確実に拾わせるため複数回キューに積む
+      for (int r = 0; r < config_frame_repeat_; ++r) {
+        tx_queue_.push_back(item);
       }
-      RCLCPP_ERROR(this->get_logger(), "TCPパケットの送信に失敗しました: %s", strerror(errno));
-      handle_disconnect("TCP送信エラー");
+    } else {
+      // 周期制御フレーム (0x220, 0x100, 0x300等) は同一CAN IDの未送信フレームがあれば最新値で上書きして遅延蓄積を防ぐ
+      for (auto & existing : tx_queue_) {
+        if (!existing.is_config_frame &&
+            existing.can_id == item.can_id &&
+            existing.send_to_can2 == item.send_to_can2)
+        {
+          std::memcpy(existing.payload, item.payload, sizeof(item.payload));
+          return;
+        }
+      }
+      // キュー上限を超えている場合は古い非設定フレームを破棄
+      if (tx_queue_.size() >= 64) {
+        for (auto it = tx_queue_.begin(); it != tx_queue_.end(); ++it) {
+          if (!it->is_config_frame) {
+            tx_queue_.erase(it);
+            break;
+          }
+        }
+      }
+      tx_queue_.push_back(item);
     }
   }
 
-  // --- 2. Ethernet-CAN ➔ ROS2トピック (RXスレッド) ---
-  void rx_thread_loop()
+  // --- 2. Ethernet-CAN 送受信統合スレッド ---
+  // LANtoCAN (STM32 + W5500) ファームウェアの以下の特性に合わせて送受信を同期制御する:
+  // 1) STM32の tcp_process() は send(60B) -> ブロッキング recv(140B) の順で動作するため、
+  //    PC側から定期的に20Bパケット(送信データまたはゼロ埋めpoll)を送らないと次の受信パケットが返らない。
+  // 2) STM32の main() ループは約0.1msで回る一方、CAN送信処理 interrupt() は1ms周期タイマーで動作し、
+  //    単一バッファ eth_recv_data の先頭20Bのみを参照する。
+  //    そのため、20Bパケットを1ms未満の間隔で連続送信したり、送信直後にゼロpollパケットを送ると、
+  //    1msタイマーが発火する前に eth_recv_data が上書きされてCAN送信が欠落する。
+  void io_thread_loop()
   {
     constexpr size_t ANALYZER_RX_SIZE = 60;
+    constexpr size_t ANALYZER_TX_SIZE = 20;
     uint8_t rx_buffer[ANALYZER_RX_SIZE];
     size_t buffer_filled = 0;
 
-    while (rx_thread_running_ && rclcpp::ok()) {
+    uint16_t last_rx_id[2] = {0, 0};
+    uint8_t last_rx_data[2][8] = {{0}, {0}};
+    auto last_rx_publish_time0 = std::chrono::steady_clock::now() - 100ms;
+    auto last_rx_publish_time1 = std::chrono::steady_clock::now() - 100ms;
+
+    auto last_wire_send_time = std::chrono::steady_clock::now() - 100ms;
+    auto last_real_tx_time = std::chrono::steady_clock::now() - 100ms;
+
+    while (io_thread_running_ && rclcpp::ok()) {
       int current_sock = -1;
       {
         std::lock_guard<std::mutex> lock(socket_mutex_);
@@ -160,77 +226,179 @@ private:
 
       if (current_sock < 0) {
         buffer_filled = 0;
-        std::this_thread::sleep_for(100ms);
+        last_rx_id[0] = 0;
+        last_rx_id[1] = 0;
+        std::this_thread::sleep_for(50ms);
         continue;
       }
 
-      // タイムアウト付きポーリング
+      // 1ms刻みでソケット受信を監視しつつ、送信タイミングを制御する
       fd_set read_fds;
       FD_ZERO(&read_fds);
       FD_SET(current_sock, &read_fds);
 
       struct timeval tv;
       tv.tv_sec = 0;
-      tv.tv_usec = 100000; // 100ms
+      tv.tv_usec = 1000; // 1ms
 
       int ret = select(current_sock + 1, &read_fds, nullptr, nullptr, &tv);
       if (ret < 0) {
-        if (errno == EINTR) continue;
-        RCLCPP_ERROR(this->get_logger(), "select エラー: %s", strerror(errno));
-        handle_disconnect("selectエラー");
-        continue;
-      } else if (ret == 0) {
-        // タイムアウト
-        continue;
-      }
-
-      // データ読み取り (60バイトたまるまで受信用)
-      ssize_t bytes_read = recv(current_sock, rx_buffer + buffer_filled, ANALYZER_RX_SIZE - buffer_filled, 0);
-      if (bytes_read <= 0) {
-        if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (errno == EINTR) {
           continue;
         }
-        RCLCPP_WARN(this->get_logger(), "TCP接続がリモートによって切断されました。");
-        handle_disconnect("相手先による切断検知");
+        RCLCPP_ERROR(this->get_logger(), "select エラー: %s", strerror(errno));
+        handle_disconnect("selectエラー");
+        buffer_filled = 0;
         continue;
       }
 
-      buffer_filled += bytes_read;
+      if (ret > 0 && FD_ISSET(current_sock, &read_fds)) {
+        ssize_t bytes_read = recv(
+          current_sock,
+          rx_buffer + buffer_filled,
+          ANALYZER_RX_SIZE - buffer_filled,
+          0);
 
-      // 60バイトに達したらパースしてパブリッシュ
-      if (buffer_filled >= ANALYZER_RX_SIZE) {
-        buffer_filled = 0;
+        if (bytes_read <= 0) {
+          if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            // 読み取り待機継続
+          } else {
+            RCLCPP_WARN(this->get_logger(), "TCP接続がリモートによって切断されました。");
+            handle_disconnect("相手先による切断検知");
+            buffer_filled = 0;
+            continue;
+          }
+        } else {
+          buffer_filled += static_cast<size_t>(bytes_read);
 
-        // 1. CAN1 受信フレームの復元 (オフセット 0..9)
-        uint16_t can1_id = (static_cast<uint16_t>(rx_buffer[0]) << 8) | rx_buffer[1];
-        if (can1_id != 0) {
-          auto frame_msg = std::make_shared<can_msgs::msg::Frame>();
-          frame_msg->header.stamp = this->now();
-          frame_msg->header.frame_id = "can1";
-          frame_msg->id = can1_id;
-          frame_msg->is_extended = false;
-          frame_msg->is_rtr = false;
-          frame_msg->is_error = false;
-          frame_msg->dlc = 8;
-          std::copy(rx_buffer + 2, rx_buffer + 10, frame_msg->data.begin());
+          // 60バイト揃ったらパースしてROS2トピックへパブリッシュ
+          if (buffer_filled >= ANALYZER_RX_SIZE) {
+            buffer_filled = 0;
+            auto now_steady = std::chrono::steady_clock::now();
 
-          can_rx_pub_->publish(*frame_msg);
+            // 1. CAN1 受信フレームの復元 (オフセット 0..9)
+            if (can_channel_ == "can1" || can_channel_ == "both") {
+              uint16_t can1_id = static_cast<uint16_t>(
+                ((static_cast<uint16_t>(rx_buffer[0]) << 8) | rx_buffer[1]) & 0x7FF);
+              if (can1_id != 0) {
+                bool changed = (can1_id != last_rx_id[0]) ||
+                  (std::memcmp(rx_buffer + 2, last_rx_data[0], 8) != 0);
+                double elapsed_ms = std::chrono::duration<double, std::milli>(
+                  now_steady - last_rx_publish_time0).count();
+                // LANtoCANは新規CANフレーム未着時も前回の can1_r_data を返し続けるため、
+                // 内容変化時または最大10ms周期でパブリッシュする
+                if (changed || elapsed_ms >= 9.0) {
+                  last_rx_id[0] = can1_id;
+                  std::memcpy(last_rx_data[0], rx_buffer + 2, 8);
+                  last_rx_publish_time0 = now_steady;
+
+                  auto frame_msg = std::make_shared<can_msgs::msg::Frame>();
+                  frame_msg->header.stamp = this->now();
+                  frame_msg->header.frame_id = "can1";
+                  frame_msg->id = can1_id;
+                  frame_msg->is_extended = false;
+                  frame_msg->is_rtr = false;
+                  frame_msg->is_error = false;
+                  frame_msg->dlc = 8;
+                  std::copy(rx_buffer + 2, rx_buffer + 10, frame_msg->data.begin());
+
+                  can_rx_pub_->publish(*frame_msg);
+                }
+              }
+            }
+
+            // 2. CAN2 受信フレームの復元 (オフセット 10..19)
+            if (can_channel_ == "can2" || can_channel_ == "both") {
+              uint16_t can2_id = static_cast<uint16_t>(
+                ((static_cast<uint16_t>(rx_buffer[10]) << 8) | rx_buffer[11]) & 0x7FF);
+              if (can2_id != 0) {
+                bool changed = (can2_id != last_rx_id[1]) ||
+                  (std::memcmp(rx_buffer + 12, last_rx_data[1], 8) != 0);
+                double elapsed_ms = std::chrono::duration<double, std::milli>(
+                  now_steady - last_rx_publish_time1).count();
+                if (changed || elapsed_ms >= 9.0) {
+                  last_rx_id[1] = can2_id;
+                  std::memcpy(last_rx_data[1], rx_buffer + 12, 8);
+                  last_rx_publish_time1 = now_steady;
+
+                  auto frame_msg = std::make_shared<can_msgs::msg::Frame>();
+                  frame_msg->header.stamp = this->now();
+                  frame_msg->header.frame_id = "can2";
+                  frame_msg->id = can2_id;
+                  frame_msg->is_extended = false;
+                  frame_msg->is_rtr = false;
+                  frame_msg->is_error = false;
+                  frame_msg->dlc = 8;
+                  std::copy(rx_buffer + 12, rx_buffer + 20, frame_msg->data.begin());
+
+                  can_rx_pub_->publish(*frame_msg);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // --- 送信 (またはRXトリガー用poll) 判定 ---
+      auto now = std::chrono::steady_clock::now();
+      double since_last_send_ms = std::chrono::duration<double, std::milli>(
+        now - last_wire_send_time).count();
+
+      // STM32の1msタイマー割り込みが確実に前回の eth_recv_data を処理できるよう、最低2.0msの間隔を空ける
+      if (since_last_send_ms < 2.0) {
+        continue;
+      }
+
+      uint8_t tx_payload[ANALYZER_TX_SIZE];
+      bool has_real_tx = false;
+      bool should_send_wire = false;
+
+      {
+        std::lock_guard<std::mutex> lock(tx_queue_mutex_);
+        if (!tx_queue_.empty()) {
+          PendingTxItem item = tx_queue_.front();
+          tx_queue_.pop_front();
+          std::memcpy(tx_payload, item.payload, ANALYZER_TX_SIZE);
+          has_real_tx = true;
+          should_send_wire = true;
+        }
+      }
+
+      if (!should_send_wire) {
+        double since_real_tx_ms = std::chrono::duration<double, std::milli>(
+          now - last_real_tx_time).count();
+        // 実フレーム送信直後はSTM32の eth_recv_data をゼロで上書きしないよう poll を抑制し、
+        // アイドル時は poll_interval_ms_ 周期で 20B ゼロパケットを送信して CAN RX を継続させる
+        if (since_last_send_ms >= poll_interval_ms_ &&
+            since_real_tx_ms >= poll_suppress_after_tx_ms_)
+        {
+          std::memset(tx_payload, 0, ANALYZER_TX_SIZE);
+          should_send_wire = true;
+        }
+      }
+
+      if (should_send_wire) {
+        ssize_t bytes_sent = -1;
+        {
+          std::lock_guard<std::mutex> lock(socket_mutex_);
+          if (is_connected_ && sock_ == current_sock) {
+            bytes_sent = send(current_sock, tx_payload, ANALYZER_TX_SIZE, MSG_NOSIGNAL);
+          }
         }
 
-        // 2. CAN2 受信フレームの復元 (オフセット 10..19)
-        uint16_t can2_id = (static_cast<uint16_t>(rx_buffer[10]) << 8) | rx_buffer[11];
-        if (can2_id != 0) {
-          auto frame_msg = std::make_shared<can_msgs::msg::Frame>();
-          frame_msg->header.stamp = this->now();
-          frame_msg->header.frame_id = "can2";
-          frame_msg->id = can2_id;
-          frame_msg->is_extended = false;
-          frame_msg->is_rtr = false;
-          frame_msg->is_error = false;
-          frame_msg->dlc = 8;
-          std::copy(rx_buffer + 12, rx_buffer + 20, frame_msg->data.begin());
+        if (bytes_sent < 0) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            continue;
+          }
+          RCLCPP_ERROR(this->get_logger(), "TCPパケットの送信に失敗しました: %s", strerror(errno));
+          handle_disconnect("TCP送信エラー");
+          buffer_filled = 0;
+          continue;
+        }
 
-          can_rx_pub_->publish(*frame_msg);
+        last_wire_send_time = now;
+        if (has_real_tx) {
+          last_real_tx_time = now;
         }
       }
     }
@@ -241,6 +409,11 @@ private:
   {
     std::lock_guard<std::mutex> lock(socket_mutex_);
     close_socket_nolock();
+
+    {
+      std::lock_guard<std::mutex> qlock(tx_queue_mutex_);
+      tx_queue_.clear();
+    }
 
     RCLCPP_INFO(this->get_logger(), "Ethernet-CAN 基板へ接続を試みています... (%s:%d)", ip.c_str(), port);
 
@@ -376,11 +549,18 @@ private:
   std::string target_ip_;
   int target_port_;
   std::string can_channel_;
+  double poll_interval_ms_;
+  double poll_suppress_after_tx_ms_;
+  int config_frame_repeat_;
   std::string last_error_;
 
+  // 送信キュー
+  std::mutex tx_queue_mutex_;
+  std::deque<PendingTxItem> tx_queue_;
+
   // スレッド制御
-  std::atomic<bool> rx_thread_running_;
-  std::thread rx_thread_;
+  std::atomic<bool> io_thread_running_;
+  std::thread io_thread_;
   std::atomic<bool> auto_connect_running_;
   std::thread auto_connect_thread_;
 
