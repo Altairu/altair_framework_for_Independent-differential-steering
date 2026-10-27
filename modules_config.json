@@ -4,25 +4,121 @@
       "name": "MDD1",
       "type": "mdd",
       "base_id": "0x200",
-      "description": "走行用4chモータドライバ",
+      "description": "タイヤ1(前方) 差動ステアリング足回り: m1=M1, m2=M2, m3=Encoder3(ステア角), m4=未使用",
       "parameters": {
-        "m1": { "p": 10.0, "i": 0.0, "d": 0.0, "diameter": 100.0, "direction": 1, "mode": 0 },
-        "m2": { "p": 10.0, "i": 0.0, "d": 0.0, "diameter": 100.0, "direction": 1, "mode": 0 },
-        "m3": { "p": 10.0, "i": 0.0, "d": 0.0, "diameter": 100.0, "direction": 1, "mode": 0 },
-        "m4": { "p": 10.0, "i": 0.0, "d": 0.0, "diameter": 100.0, "direction": 1, "mode": 0 }
+        "m1": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m2": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m3": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m4": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        }
       }
     },
     {
-      "name": "Servo1",
-      "type": "servo",
-      "base_id": "0x100",
-      "description": "アーム制御用6chサーボ"
+      "name": "MDD2",
+      "type": "mdd",
+      "base_id": "0x204",
+      "description": "タイヤ2(右後方) 差動ステアリング足回り: m1=M1, m2=M2, m3=Encoder3(ステア角), m4=未使用",
+      "parameters": {
+        "m1": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m2": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m3": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m4": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        }
+      }
     },
     {
-      "name": "Solenoid1",
-      "type": "solenoid",
-      "base_id": "0x300",
-      "description": "吸引・ハンド用12ch電磁弁"
+      "name": "MDD3",
+      "type": "mdd",
+      "base_id": "0x208",
+      "description": "タイヤ3(左後方) 差動ステアリング足回り: m1=M1, m2=M2, m3=Encoder3(ステア角), m4=未使用",
+      "parameters": {
+        "m1": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m2": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m3": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m4": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        }
+      }
     }
   ]
 }
