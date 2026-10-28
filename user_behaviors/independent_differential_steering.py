@@ -80,6 +80,13 @@ STEER_SIGN = [1.0, 1.0, 1.0]
 ENC3_SIGN = [-1.0, -1.0, -1.0]
 ENC3_OFFSET = [0.0, 0.0, 0.0]
 
+# --- 各タイヤの初期配置角度 (ロボット中心から外向きの角度 [deg]) ---
+# 前方(+Y)を0度、右(+X)を+90度としたとき、正三角形の中心から各タイヤへの方向:
+#   タイヤ1 (前方):     0.0 deg (前向き)
+#   タイヤ2 (右後方): +120.0 deg (右後方外向き)
+#   タイヤ3 (左後方): -120.0 deg (左後方外向き)
+WHEEL_INITIAL_ANGLES = [0.0, 120.0, -120.0]
+
 # --- ステアリング角度PID (出力: deg/s) ---
 STEER_KP = 15.0              # [deg/s per deg]
 STEER_KI = 0.0              # [deg/s per (deg*s)]
@@ -210,9 +217,14 @@ class SwerveModule:
         }
 
     def measured_angle(self):
-        """Encoder 3 から現在のステアリング角度 [deg] を取得。"""
+        """
+        Encoder 3 からロボット座標系における現在のステアリング角度 [deg] を取得。
+        初期状態(外向き)の角度 WHEEL_INITIAL_ANGLES を基準とし、
+        エンコーダ変化量を加算してロボット座標系(-180〜+180 deg)に換算する。
+        """
         raw = self.mdd.get_feedback().angles[CH_ENC3]
-        return wrap_to_180(ENC3_SIGN[self.index] * (raw - ENC3_OFFSET[self.index]))
+        angle_from_initial = ENC3_SIGN[self.index] * (raw - ENC3_OFFSET[self.index])
+        return wrap_to_180(WHEEL_INITIAL_ANGLES[self.index] + angle_from_initial)
 
     def is_running(self):
         return self.mdd.get_feedback().system_status == 1
