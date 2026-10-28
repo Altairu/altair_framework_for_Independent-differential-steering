@@ -13,23 +13,19 @@
   - 左スティック Y (axis 1) : Vy  前方向速度 [mm/s]  (スティック上で前進)
   - 右スティック X (axis 2) : omega 角速度 [deg/s]  (右倒しで右回転)
 
-ハードウェア割り当て (profiles/hoge.json):
+ハードウェア割り当て:
   - MDD1 : タイヤ1 (前方)
-  - MDD2 : タイヤ2 (右後方)
-  - MDD3 : タイヤ3 (左後方)
+  - MDD2 : タイヤ2 (右後方)  ※接続されている場合のみ自動制御
+  - MDD3 : タイヤ3 (左後方)  ※接続されている場合のみ自動制御
   各MDD:
     m1 = モーター M1 (速度モード, Encoder 1)
     m2 = モーター M2 (速度モード, Encoder 2)
     m3 = Encoder 3 (ステアリング角度。モーターは接続しない / 出力0)
     m4 = 未使用
 
-制御の流れ (差動ステアリング機構.md 9章):
-  1. ゲームパッドから Vx, Vy, omega_deg を生成
-  2. 逆運動学で各タイヤの (V_target_i, theta_target_i) を算出
-  3. Encoder 3 の角度から最短角度誤差を計算 (180度反転の等価解も利用)
-  4. 角度PID -> 目標ステアリング角速度 steer_rate_target_i
-  5. (V_target_i, steer_rate_target_i) -> M1, M2 の目標回転数 [rps]
-  6. MDD の速度PID (Encoder 1・2) が M1, M2 を速度制御
+※単体実験対応:
+  modules_config.json に MDD1 のみが定義されている場合でも、
+  タイヤ1（前方）のみを正常に差動制御・ステアリング制御します。
 """
 
 import sys
@@ -54,25 +50,21 @@ AXIS_VX = 0                 # 左スティック X
 AXIS_VY = 1                 # 左スティック Y (上で負の値)
 AXIS_OMEGA = 2              # 右スティック X
 V_MAX = 800.0               # スティック最大時の並進速度 [mm/s]
-OMEGA_MAX = 90.0            # スティック最大時の角速度 [deg/s]
-STICK_DEADZONE = 0.08       # スティックのデッドゾーン (Web側の0.05に加えて)
+OMEGA_MAX = 200.0            # スティック最大時の角速度 [deg/s]
+STICK_DEADZONE = 0.08       # スティックのデッドゾーン
 GAMEPAD_TIMEOUT = 0.5       # この時間ゲームパッド入力が来なければ停止 [s]
 
 # --- ロボット幾何 (運動学.md 2章) ---
 # (x_i, y_i) [mm]  右が +X, 前が +Y
 WHEEL_POSITIONS = [
-    (0.0, 190.53),          # タイヤ1：前方
-    (165.00, -95.265),      # タイヤ2：右後方
-    (-165.00, -95.265),     # タイヤ3：左後方
+    (0.0, 190.53),          # タイヤ1：前方 (MDD1)
+    (165.00, -95.265),      # タイヤ2：右後方 (MDD2)
+    (-165.00, -95.265),     # タイヤ3：左後方 (MDD3)
 ]
 WHEEL_DIAMETER = 70.0       # [mm]
 
 # --- 差動ステアリング機構の換算係数 (差動ステアリング機構.md 3,4章) ---
-# n_wheel = DRIVE_RATIO * (n1 - n2)        (M1,M2逆方向1回転ずつ -> タイヤ0.875回転)
 DRIVE_RATIO = 0.4375
-# steer_rate[deg/s] = STEER_DEG_PER_REV_SUM * (n1 + n2)[rps]
-#   (M1,M2同方向1回転ずつ -> ステア180度)  => 180 / 2 = 90 deg per (rev-sum)
-#   ※ RPM 基準では 1.5 deg/s per RPM-sum と等価
 STEER_DEG_PER_REV_SUM = 90.0
 
 # --- MDD チャンネル割り当て (0始まりインデックス) ---
@@ -81,32 +73,28 @@ CH_M1 = 0
 CH_M2 = 1
 CH_ENC3 = 2
 
-# --- 符号・オフセット補正 (差動ステアリング機構.md 10章の試験結果で調整) ---
-# DRIVE_SIGN : 正の V でタイヤが theta 方向へ進まない場合は -1
-# STEER_SIGN : 正の steer_rate で右回り(上から見て時計回り)にならない場合は -1
-# ENC3_SIGN  : Encoder 3 の角度が右回りで増加しない場合は -1
-# ENC3_OFFSET: タイヤが前方 (+Y) を向いているときの Encoder 3 の生値 [deg]
+# --- 符号・オフセット補正 ---
 DRIVE_SIGN = [1.0, 1.0, 1.0]
 STEER_SIGN = [1.0, 1.0, 1.0]
-ENC3_SIGN = [1.0, 1.0, 1.0]
+ENC3_SIGN = [-1.0, 1.0, 1.0]
 ENC3_OFFSET = [0.0, 0.0, 0.0]
 
 # --- ステアリング角度PID (出力: deg/s) ---
-STEER_KP = 6.0              # [deg/s per deg]
+STEER_KP = 15.0              # [deg/s per deg]
 STEER_KI = 0.0              # [deg/s per (deg*s)]
-STEER_KD = 0.0              # [deg/s per (deg/s)]  (測定値微分)
+STEER_KD = 0.0              # [deg/s per (deg/s)]
 STEER_I_LIMIT = 60.0        # 積分項の上限 [deg/s]
-STEER_RATE_MAX = 540.0      # ステアリング角速度上限 [deg/s]
+STEER_RATE_MAX = 1000.0      # ステアリング角速度上限 [deg/s]
 
-# --- ステアリング・駆動の協調 (差動ステアリング機構.md 7.1, 8章) ---
-USE_FLIP_OPTIMIZATION = True    # (V, θ) と (-V, θ+180) の近い方を選ぶ
-FLIP_HYSTERESIS = 10.0          # 反転判定のヒステリシス [deg]
-DRIVE_COS_SCALING = True        # 角度誤差 e に対し V *= cos(e) で駆動を抑制
-DRIVE_ENABLE_ERROR = 45.0       # 角度誤差がこれを超える間は駆動速度0 [deg]
-V_EPS = 5.0                     # これ未満の速度は停止扱い、ステア角を保持 [mm/s]
+# --- ステアリング・駆動の協調 ---
+USE_FLIP_OPTIMIZATION = True
+FLIP_HYSTERESIS = 10.0      # [deg]
+DRIVE_COS_SCALING = True
+DRIVE_ENABLE_ERROR = 45.0   # [deg]
+V_EPS = 5.0                 # [mm/s]
 
 # --- モーター上限 ---
-MOTOR_RPS_MAX = 20.0        # M1, M2 の目標回転数上限 [rps]
+MOTOR_RPS_MAX = 50.0        # [rps]
 
 # --- ログ ---
 LOG_INTERVAL = 1.0          # [s]
@@ -188,12 +176,10 @@ class SteerPID:
         self.prev_measured = None
 
     def update(self, error_deg, measured_deg, dt):
-        # 積分 (アンチワインドアップ)
         if STEER_KI > 0.0:
             self.integral += STEER_KI * error_deg * dt
             self.integral = clamp(self.integral, -STEER_I_LIMIT, STEER_I_LIMIT)
 
-        # 微分 (目標の反転による跳ねを避けるため測定値の微分を使用)
         d_term = 0.0
         if self.prev_measured is not None and dt > 0.0:
             d_meas = wrap_to_180(measured_deg - self.prev_measured) / dt
@@ -217,10 +203,13 @@ class SwerveModule:
         self.flipped = False        # (−V, θ+180) を採用中か
 
         # ログ用
-        self.last = {}
+        self.last = {
+            "theta_t": 0.0, "theta_m": 0.0, "err": 0.0,
+            "v": 0.0, "rate": 0.0, "n1": 0.0, "n2": 0.0,
+        }
 
     def measured_angle(self):
-        """Encoder 3 から現在のステアリング角度 [deg] (前方0, 右回り正) を取得。"""
+        """Encoder 3 から現在のステアリング角度 [deg] を取得。"""
         raw = self.mdd.get_feedback().angles[CH_ENC3]
         return wrap_to_180(ENC3_SIGN[self.index] * (raw - ENC3_OFFSET[self.index]))
 
@@ -295,16 +284,30 @@ class SwerveModule:
 class IndependentDifferentialSteering(AltairBehavior):
     def on_init(self):
         self.get_logger().info("3輪独立差動ステアリング Behavior を初期化します。")
-        self.wheels = [
-            SwerveModule(i, self.get_module(name))
-            for i, name in enumerate(MDD_NAMES)
-        ]
+        
+        # 設定ファイルに登録されているMDDのみを動的に検出して登録
+        configured_module_names = [m['name'] for m in self.config.get('modules', []) if m.get('type') == 'mdd']
+        self.active_wheels = []
+        for i, name in enumerate(MDD_NAMES):
+            if name in configured_module_names:
+                try:
+                    module_client = self.get_module(name)
+                    swerve = SwerveModule(i, module_client)
+                    self.active_wheels.append((i, swerve))
+                    self.get_logger().info(f"タイヤ{i + 1} ({name}) を制御対象として登録しました。")
+                except Exception as e:
+                    self.get_logger().warn(f"モジュール {name} の初期化に失敗しました: {e}")
+            else:
+                self.get_logger().info(f"タイヤ{i + 1} ({name}) は設定に存在しないためスキップします (単輪実験モード)")
+
+        if not self.active_wheels:
+            self.get_logger().error("有効な MDD モジュールが1つも見つかりませんでした。modules_config.json を確認してください。")
+
         self.last_gamepad_time = 0.0
         self.prev_time = time.monotonic()
         self.last_log_time = 0.0
         self.was_active = False
 
-    # ゲームパッド受信時刻を記録してタイムアウト検知に使う
     def _gamepad_callback(self, msg):
         super()._gamepad_callback(msg)
         self.last_gamepad_time = time.monotonic()
@@ -315,11 +318,10 @@ class IndependentDifferentialSteering(AltairBehavior):
         ly = apply_deadzone(self.gamepad.get_axis(AXIS_VY), STICK_DEADZONE)
         rx = apply_deadzone(self.gamepad.get_axis(AXIS_OMEGA), STICK_DEADZONE)
 
-        vx = lx * V_MAX
+        vx = lx * -V_MAX
         vy = -ly * V_MAX            # スティック上 (負) で前進
         omega_deg = rx * OMEGA_MAX  # 右倒しで右回転 (正)
 
-        # 斜め入力で V_MAX を超えないように制限
         v = math.hypot(vx, vy)
         if v > V_MAX:
             vx *= V_MAX / v
@@ -327,7 +329,7 @@ class IndependentDifferentialSteering(AltairBehavior):
         return vx, vy, omega_deg
 
     def stop_all(self):
-        for w in self.wheels:
+        for _, w in self.active_wheels:
             w.stop()
             w.pid.reset()
 
@@ -336,16 +338,19 @@ class IndependentDifferentialSteering(AltairBehavior):
         dt = clamp(now - self.prev_time, 0.0, 0.1)
         self.prev_time = now
 
-        # 安全条件: ゲームパッドが途絶 / MDD が制御実行中でない
+        if not self.active_wheels:
+            return
+
+        # 安全条件: ゲームパッド接続 ＆ 有効なMDDがすべて制御実行中
         gamepad_alive = (now - self.last_gamepad_time) < GAMEPAD_TIMEOUT
-        mdd_running = all(w.is_running() for w in self.wheels)
+        mdd_running = all(w.is_running() for _, w in self.active_wheels)
 
         if not (gamepad_alive and mdd_running):
             if self.was_active:
                 reason = "ゲームパッド途絶" if not gamepad_alive else "MDD 非実行状態"
                 self.get_logger().warn(f"停止します ({reason})")
             self.stop_all()
-            for w in self.wheels:
+            for _, w in self.active_wheels:
                 w.reset()
             self.was_active = False
             return
@@ -355,24 +360,25 @@ class IndependentDifferentialSteering(AltairBehavior):
             self.was_active = True
 
         vx, vy, omega_deg = self.read_command()
-        wheel_cmds = inverse_kinematics(vx, vy, omega_deg)
+        all_wheel_cmds = inverse_kinematics(vx, vy, omega_deg)
 
-        for w, (v_i, theta_i) in zip(self.wheels, wheel_cmds):
+        # 登録されているタイヤのみ指令を更新
+        for i, w in self.active_wheels:
+            v_i, theta_i = all_wheel_cmds[i]
             w.update(v_i, theta_i, dt)
 
         if now - self.last_log_time >= LOG_INTERVAL:
             self.last_log_time = now
             parts = [f"cmd Vx={vx:.0f} Vy={vy:.0f} w={omega_deg:.1f}"]
-            for w in self.wheels:
+            for i, w in self.active_wheels:
                 s = w.last
                 parts.append(
-                    f"T{w.index + 1}[θt={s['theta_t']:.1f} θm={s['theta_m']:.1f} "
+                    f"T{i + 1}[θt={s['theta_t']:.1f} θm={s['theta_m']:.1f} "
                     f"e={s['err']:.1f} V={s['v']:.0f} n1={s['n1']:.2f} n2={s['n2']:.2f}]"
                 )
             self.get_logger().info(" ".join(parts))
 
     def destroy_node(self):
-        # 終了時にモーターを停止
         try:
             self.stop_all()
         except Exception:
