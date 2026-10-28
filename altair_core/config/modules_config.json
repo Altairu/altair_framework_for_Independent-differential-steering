@@ -39,6 +39,86 @@
           "mode": 0
         }
       }
+    },
+    {
+      "name": "MDD2",
+      "type": "mdd",
+      "base_id": "0x204",
+      "description": "タイヤ2(右後方) 差動ステアリング足回り: m1=M1, m2=M2, m3=Encoder3(ステア角), m4=未使用",
+      "parameters": {
+        "m1": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m2": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m3": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m4": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        }
+      }
+    },
+    {
+      "name": "MDD3",
+      "type": "mdd",
+      "base_id": "0x208",
+      "description": "タイヤ3(左後方) 差動ステアリング足回り: m1=M1, m2=M2, m3=Encoder3(ステア角), m4=未使用",
+      "parameters": {
+        "m1": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m2": {
+          "p": 10,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m3": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        },
+        "m4": {
+          "p": 0,
+          "i": 0,
+          "d": 0,
+          "diameter": 70,
+          "direction": 1,
+          "mode": 0
+        }
+      }
     }
   ]
 }

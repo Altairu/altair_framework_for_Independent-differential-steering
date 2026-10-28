@@ -5,8 +5,9 @@ import time
 import json
 import os
 
-# メッセージ定義
+# メッセージ・サービス定義
 from altair_interfaces.msg import MddFeedback, MddCommand, ServoCommand, SolenoidCommand
+from altair_interfaces.srv import TriggerControl
 from std_msgs.msg import String
 
 class GamepadState:
@@ -197,6 +198,42 @@ class AltairBehavior(Node):
 
         self._module_clients[name] = client
         return client
+
+    def request_start_control(self, timeout_sec=2.0):
+        """
+        モジュールマネージャーにパラメータ送信および制御モード遷移を要求します。
+        Behavior起動時や待機状態からの自動復帰に使用します。
+        """
+        if not hasattr(self, '_start_control_cli'):
+            self._start_control_cli = self.create_client(
+                TriggerControl, '/altair/start_control',
+                callback_group=self.callback_group
+            )
+
+        if not self._start_control_cli.wait_for_service(timeout_sec=timeout_sec):
+            self.get_logger().warn("制御開始サービス '/altair/start_control' が見つかりません。")
+            return False
+
+        req = TriggerControl.Request()
+        future = self._start_control_cli.call_async(req)
+        
+        # コールバックグループがReentrantのため、完了まで少し待機
+        start_t = time.monotonic()
+        while not future.done() and (time.monotonic() - start_t < timeout_sec):
+            time.sleep(0.01)
+
+        if future.done():
+            res = future.result()
+            if res and res.success:
+                self.get_logger().info(f"制御開始要求が受理されました: {res.message}")
+                return True
+            else:
+                msg = res.message if res else "レスポンスなし"
+                self.get_logger().warn(f"制御開始要求が失敗しました: {msg}")
+                return False
+        else:
+            self.get_logger().warn("制御開始要求がタイムアウトしました。")
+            return False
 
     def on_init(self):
         """

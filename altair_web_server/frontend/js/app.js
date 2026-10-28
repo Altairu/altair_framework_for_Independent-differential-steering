@@ -1190,6 +1190,25 @@ document.addEventListener("DOMContentLoaded", () => {
   // --- 11. 動作プログラム(Behavior)の起動 ＆ 停止制御 ---
   el.btnStartBehavior.addEventListener("click", async () => {
     const script = el.selBehaviorScript.value;
+    
+    // マイコンが待機状態 (SETUP) の場合は、プログラム起動前に自動的にパラメータ送信を実行する
+    if (state.controlMode !== "CONTROL") {
+      appendTerminalLog(el.behaviorTerminal, "[SYSTEM] マイコンが待機状態のため、自動的にパラメータを送信して制御を開始します...", "system-msg");
+      try {
+        const paramRes = await fetch("/api/control/start", { method: "POST" });
+        const paramData = await paramRes.json();
+        if (paramData.success) {
+          appendTerminalLog(el.behaviorTerminal, `[SYSTEM] ${paramData.message}`, "system-msg");
+          state.controlMode = "CONTROL";
+          state.controlStartTimeMs = Date.now();
+        } else {
+          appendTerminalLog(el.behaviorTerminal, `[WARN] パラメータ送信に失敗しましたが起動を継続します: ${paramData.message}`, "error-msg");
+        }
+      } catch (e) {
+        appendTerminalLog(el.behaviorTerminal, `[WARN] パラメータ送信リクエストエラー: ${e}`, "error-msg");
+      }
+    }
+
     appendTerminalLog(el.behaviorTerminal, `プログラム '${script}' の起動要求を送信...`);
     try {
       const res = await fetch("/api/behavior/start", {

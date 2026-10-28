@@ -77,7 +77,7 @@ CH_ENC3 = 2
 # --- 符号・オフセット補正 ---
 DRIVE_SIGN = [1.0, 1.0, 1.0]
 STEER_SIGN = [1.0, 1.0, 1.0]
-ENC3_SIGN = [-1.0, 1.0, 1.0]
+ENC3_SIGN = [-1.0, -1.0, -1.0]
 ENC3_OFFSET = [0.0, 0.0, 0.0]
 
 # --- ステアリング角度PID (出力: deg/s) ---
@@ -98,7 +98,7 @@ V_EPS = 5.0                 # [mm/s]
 MOTOR_RPS_MAX = 50.0        # [rps]
 
 # --- ログ ---
-LOG_INTERVAL = 1.0          # [s]
+LOG_INTERVAL = 5.0          # [s]
 
 
 # =====================================================================
@@ -333,7 +333,20 @@ class IndependentDifferentialSteering(AltairBehavior):
         self.last_gamepad_time = 0.0
         self.prev_time = time.monotonic()
         self.last_log_time = 0.0
+        self.last_control_start_request_time = 0.0
         self.was_active = False
+
+        # 起動時にMDDが待機状態(0)であれば、自動的に制御開始(パラメータ送信)を要求する
+        self.request_control_if_needed()
+
+    def request_control_if_needed(self):
+        """MDDが待機状態の場合、module_managerに自動制御開始を要求する"""
+        now = time.monotonic()
+        if now - self.last_control_start_request_time < 3.0:
+            return  # 3秒間のクールダウン
+        self.last_control_start_request_time = now
+        self.get_logger().info("MDDパラメータ送信および制御モード遷移を自動要求します...")
+        self.request_start_control(timeout_sec=2.0)
 
     def _gamepad_callback(self, msg):
         super()._gamepad_callback(msg)
@@ -373,6 +386,10 @@ class IndependentDifferentialSteering(AltairBehavior):
         mdd_running = all(w.is_running() for _, w in self.active_wheels)
 
         if not (gamepad_alive and mdd_running):
+            if not mdd_running:
+                # MDDが待機状態（パラメータ未送信）の場合は自動復旧を要求
+                self.request_control_if_needed()
+
             if self.was_active:
                 reason = "ゲームパッド途絶" if not gamepad_alive else "MDD 非実行状態"
                 self.get_logger().warn(f"停止します ({reason})")
