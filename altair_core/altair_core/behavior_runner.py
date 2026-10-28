@@ -159,27 +159,28 @@ class BehaviorRunner(Node):
         """
         現在実行中のプロセスを安全にキルする
         """
-        if self.current_process is None:
+        proc = self.current_process
+        if proc is None:
             return True
 
         self.status = "STOPPING"
-        self.get_logger().info(f"プロセスグループ {self.current_process.pid} に停止信号 (SIGINT) を送信します...")
+        self.get_logger().info(f"プロセスグループ {proc.pid} に停止信号 (SIGINT) を送信します...")
 
         try:
             # プロセスグループ全体に SIGINT (Ctrl+C) を送信
-            os.killpg(os.getpgid(self.current_process.pid), signal.SIGINT)
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
             
             # 最大 3秒 安全な終了を待つ
             for _ in range(30):
-                if self.current_process.poll() is not None:
+                if proc.poll() is not None:
                     break
                 time.sleep(0.1)
 
             # まだ終了していなければ強制終了 (SIGKILL)
-            if self.current_process.poll() is None:
+            if proc.poll() is None:
                 self.get_logger().warn("プロセスが安全に終了しなかったため、強制終了 (SIGKILL) します。")
-                os.killpg(os.getpgid(self.current_process.pid), signal.SIGKILL)
-                self.current_process.wait()
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait()
 
             self.get_logger().info("プロセスは正常に終了しました。")
             self.current_process = None

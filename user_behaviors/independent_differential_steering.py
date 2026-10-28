@@ -52,7 +52,8 @@ AXIS_OMEGA = 2              # 右スティック X
 V_MAX = 800.0               # スティック最大時の並進速度 [mm/s]
 OMEGA_MAX = 200.0            # スティック最大時の角速度 [deg/s]
 STICK_DEADZONE = 0.08       # スティックのデッドゾーン
-GAMEPAD_TIMEOUT = 0.5       # この時間ゲームパッド入力が来なければ停止 [s]
+GAMEPAD_TIMEOUT = 1.0       # この時間ゲームパッド入力が来なければ停止 [s] (ジッター耐性向上)
+STEER_DEADBAND = 2.0        # ステア角度不感帯 [deg] (微小誤差によるステア回転・発振を防止)
 
 # --- ロボット幾何 (運動学.md 2章) ---
 # (x_i, y_i) [mm]  右が +X, 前が +Y
@@ -217,16 +218,37 @@ class SwerveModule:
         return self.mdd.get_feedback().system_status == 1
 
     def stop(self):
-        self.mdd.set_targets([0.0, 0.0, 0.0, 0.0])
+        """モーター出力を即座に完全停止(0.0)にし、制御状態をリセットする。"""
+        self.pid.reset()
+        self.hold_theta = None
+        self.flipped = False
+        targets = [0.0, 0.0, 0.0, 0.0]
+        self.mdd.set_targets(targets)
+        self.last = {
+            "theta_t": 0.0, "theta_m": self.measured_angle(), "err": 0.0,
+            "v": 0.0, "rate": 0.0, "n1": 0.0, "n2": 0.0,
+        }
 
     def reset(self):
         self.pid.reset()
         self.hold_theta = None
         self.flipped = False
 
-    def update(self, v_target, theta_target, dt):
+    def update(self, v_target, theta_target, dt, is_stopped=False):
         i = self.index
         theta_meas = self.measured_angle()
+
+        # 操縦入力ゼロ(完全停止中)のときは、ステア角度PIDを実行せず完全ゼロ出力を保証する
+        if is_stopped:
+            self.pid.reset()
+            self.hold_theta = theta_meas
+            targets = [0.0, 0.0, 0.0, 0.0]
+            self.mdd.set_targets(targets)
+            self.last = {
+                "theta_t": theta_meas, "theta_m": theta_meas, "err": 0.0,
+                "v": 0.0, "rate": 0.0, "n1": 0.0, "n2": 0.0,
+            }
+            return
 
         # 速度が小さいときは角度を前回値に保持 (初回は現在角)
         if theta_target is None:
@@ -251,8 +273,13 @@ class SwerveModule:
 
         error = wrap_to_180(theta_cmd - theta_meas)
 
-        # 角度PID -> ステアリング角速度
-        steer_rate = self.pid.update(error, theta_meas, dt)
+        # ステア不感帯 (微小誤差でのステア回転・発振を防止)
+        if abs(error) < STEER_DEADBAND:
+            steer_rate = 0.0
+            self.pid.reset()
+        else:
+            # 角度PID -> ステアリング角速度
+            steer_rate = self.pid.update(error, theta_meas, dt)
 
         # ステア誤差が大きい間は駆動を抑制
         if abs(error) > DRIVE_ENABLE_ERROR:
@@ -329,9 +356,9 @@ class IndependentDifferentialSteering(AltairBehavior):
         return vx, vy, omega_deg
 
     def stop_all(self):
+        """すべての登録タイヤに完全停止指令を送信する。"""
         for _, w in self.active_wheels:
             w.stop()
-            w.pid.reset()
 
     def loop(self):
         now = time.monotonic()
@@ -349,10 +376,9 @@ class IndependentDifferentialSteering(AltairBehavior):
             if self.was_active:
                 reason = "ゲームパッド途絶" if not gamepad_alive else "MDD 非実行状態"
                 self.get_logger().warn(f"停止します ({reason})")
+                self.was_active = False
+            # 途絶中・非実行中は毎周期確実にゼロ送信とリセットを維持
             self.stop_all()
-            for _, w in self.active_wheels:
-                w.reset()
-            self.was_active = False
             return
 
         if not self.was_active:
@@ -360,12 +386,15 @@ class IndependentDifferentialSteering(AltairBehavior):
             self.was_active = True
 
         vx, vy, omega_deg = self.read_command()
+        # 操縦入力が完全ゼロ(スティック中立)かどうかを判定
+        is_stopped = (abs(vx) < 1e-3 and abs(vy) < 1e-3 and abs(omega_deg) < 1e-3)
+
         all_wheel_cmds = inverse_kinematics(vx, vy, omega_deg)
 
         # 登録されているタイヤのみ指令を更新
         for i, w in self.active_wheels:
             v_i, theta_i = all_wheel_cmds[i]
-            w.update(v_i, theta_i, dt)
+            w.update(v_i, theta_i, dt, is_stopped=is_stopped)
 
         if now - self.last_log_time >= LOG_INTERVAL:
             self.last_log_time = now
@@ -380,7 +409,9 @@ class IndependentDifferentialSteering(AltairBehavior):
 
     def destroy_node(self):
         try:
-            self.stop_all()
+            for _ in range(5):
+                self.stop_all()
+                time.sleep(0.01)
         except Exception:
             pass
         super().destroy_node()
