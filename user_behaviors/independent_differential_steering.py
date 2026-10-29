@@ -76,8 +76,8 @@ CH_ENC3 = 2
 
 # --- 符号・オフセット補正 ---
 DRIVE_SIGN = [1.0, 1.0, 1.0]
-STEER_SIGN = [1.0, 1.0, 1.0]
-ENC3_SIGN = [-1.0, -1.0, -1.0]
+STEER_SIGN = [-1.0, -1.0, -1.0]
+ENC3_SIGN = [1.0, 1.0, 1.0]
 ENC3_OFFSET = [0.0, 0.0, 0.0]
 
 # --- 各タイヤの初期配置角度 (ロボット中心から外向きの角度 [deg]) ---
@@ -95,6 +95,7 @@ STEER_I_LIMIT = 60.0        # 積分項の上限 [deg/s]
 STEER_RATE_MAX = 1000.0      # ステアリング角速度上限 [deg/s]
 
 # --- ステアリング・駆動の協調 ---
+# True: 目標角が90度を超える場合はタイヤを180度回さず、タイヤの回転方向(駆動)を逆転させて最短で追従する
 USE_FLIP_OPTIMIZATION = True
 FLIP_HYSTERESIS = 10.0      # [deg]
 DRIVE_COS_SCALING = True
@@ -103,6 +104,11 @@ V_EPS = 5.0                 # [mm/s]
 
 # --- モーター上限 ---
 MOTOR_RPS_MAX = 50.0        # [rps]
+
+# --- 実験・耐故障設定 ---
+# True の場合、一部のタイヤ(MDD)が未接続または電源OFFでも、
+# 正常に応答しているタイヤのみで自動的に制御を開始します (単輪・2輪実験対応)
+ALLOW_PARTIAL_WHEELS = True
 
 # --- ログ ---
 LOG_INTERVAL = 5.0          # [s]
@@ -280,7 +286,7 @@ class SwerveModule:
             if abs(err_cur) > 90.0 + FLIP_HYSTERESIS:
                 self.flipped = not self.flipped
             if self.flipped:
-                theta_cmd = theta_target + 180.0
+                theta_cmd = wrap_to_180(theta_target + 180.0)
                 v_cmd = -v_target
 
         error = wrap_to_180(theta_cmd - theta_meas)
@@ -345,11 +351,9 @@ class IndependentDifferentialSteering(AltairBehavior):
         self.last_gamepad_time = 0.0
         self.prev_time = time.monotonic()
         self.last_log_time = 0.0
+        self.last_warn_time = 0.0
         self.last_control_start_request_time = 0.0
         self.was_active = False
-
-        # 起動時にMDDが待機状態(0)であれば、自動的に制御開始(パラメータ送信)を要求する
-        self.request_control_if_needed()
 
     def request_control_if_needed(self):
         """MDDが待機状態の場合、module_managerに自動制御開始を要求する"""
@@ -370,9 +374,9 @@ class IndependentDifferentialSteering(AltairBehavior):
         ly = apply_deadzone(self.gamepad.get_axis(AXIS_VY), STICK_DEADZONE)
         rx = apply_deadzone(self.gamepad.get_axis(AXIS_OMEGA), STICK_DEADZONE)
 
-        vx = lx * -V_MAX
+        vx = lx * V_MAX
         vy = -ly * V_MAX            # スティック上 (負) で前進
-        omega_deg = rx * OMEGA_MAX  # 右倒しで右回転 (正)
+        omega_deg = rx * OMEGA_MAX # 旋回方向を正転(右倒しで時計回り)に合わせるため反転
 
         v = math.hypot(vx, vy)
         if v > V_MAX:
@@ -393,25 +397,46 @@ class IndependentDifferentialSteering(AltairBehavior):
         if not self.active_wheels:
             return
 
-        # 安全条件: ゲームパッド接続 ＆ 有効なMDDがすべて制御実行中
+        # 各タイヤの実行状態を取得
+        running_wheels = [(i, w) for i, w in self.active_wheels if w.is_running()]
+        not_running_wheels = [(i, w) for i, w in self.active_wheels if not w.is_running()]
+
+        # 安全条件の判定
         gamepad_alive = (now - self.last_gamepad_time) < GAMEPAD_TIMEOUT
-        mdd_running = all(w.is_running() for _, w in self.active_wheels)
+
+        if ALLOW_PARTIAL_WHEELS:
+            # 応答のあるタイヤが1輪以上あれば制御実行可能とする (耐故障・単輪/2輪実験モード)
+            mdd_running = len(running_wheels) > 0
+            controlling_wheels = running_wheels
+        else:
+            # 設定された全タイヤが正常に実行中である必要がある
+            mdd_running = len(not_running_wheels) == 0
+            controlling_wheels = self.active_wheels
 
         if not (gamepad_alive and mdd_running):
-            if not mdd_running:
-                # MDDが待機状態（パラメータ未送信）の場合は自動復旧を要求
+            if len(running_wheels) == 0:
+                # 応答中のMDDが1台もない場合は自動復旧(パラメータ送信)を要求
                 self.request_control_if_needed()
 
-            if self.was_active:
-                reason = "ゲームパッド途絶" if not gamepad_alive else "MDD 非実行状態"
-                self.get_logger().warn(f"停止します ({reason})")
+            if self.was_active or (now - self.last_warn_time >= 3.0):
+                self.last_warn_time = now
+                if not gamepad_alive:
+                    self.get_logger().warn("停止中: ゲームパッド入力途絶 (スティックを操作してください)")
+                else:
+                    unready_names = [f"タイヤ{i+1}({MDD_NAMES[i]})" for i, _ in not_running_wheels]
+                    self.get_logger().warn(f"停止中: 待機または未接続のモジュール: {', '.join(unready_names)}")
                 self.was_active = False
+
             # 途絶中・非実行中は毎周期確実にゼロ送信とリセットを維持
             self.stop_all()
             return
 
         if not self.was_active:
-            self.get_logger().info("制御を開始します。")
+            ready_names = [f"タイヤ{i+1}({MDD_NAMES[i]})" for i, _ in controlling_wheels]
+            self.get_logger().info(f"制御を開始します。(アクティブ対象: {', '.join(ready_names)})")
+            if not_running_wheels:
+                unready_names = [f"タイヤ{i+1}({MDD_NAMES[i]})" for i, _ in not_running_wheels]
+                self.get_logger().warn(f"※未接続または待機中のためスキップ中: {', '.join(unready_names)}")
             self.was_active = True
 
         vx, vy, omega_deg = self.read_command()
@@ -420,8 +445,8 @@ class IndependentDifferentialSteering(AltairBehavior):
 
         all_wheel_cmds = inverse_kinematics(vx, vy, omega_deg)
 
-        # 登録されているタイヤのみ指令を更新
-        for i, w in self.active_wheels:
+        # 実行中のタイヤのみ指令を更新 (未接続のタイヤには干渉しない)
+        for i, w in controlling_wheels:
             v_i, theta_i = all_wheel_cmds[i]
             w.update(v_i, theta_i, dt, is_stopped=is_stopped)
 

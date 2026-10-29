@@ -307,6 +307,7 @@ class ModuleManager(Node):
                     cache['limit_switches'] = [bool(b) for b in data[0:4]]
                     cache['error_code'] = data[4]
 
+                    cache['has_received_rx'] = True
                     in_grace_period = (time.monotonic() - self.control_start_monotonic) < 4.0
                     if data[5] == 0 and self.is_running and in_grace_period:
                         # 制御開始直後の遷移猶予期間中は、古い待機ステータス(0)による誤リセットを防ぐ
@@ -324,15 +325,16 @@ class ModuleManager(Node):
                                 break
                         self.get_logger().warn(f"マイコン '{module_name}' の待機状態へのリセットを検知したため、PC側の制御フラグを安全にリセットしました。")
 
-                    # すべてのMDDが制御実行中(1)である場合、PC側のis_runningがFalseになっていれば自動同期復帰させる
+                    # 通信中のMDDマイコンがすべて制御実行中(1)であれば、PC側のis_runningを自動同期復帰させる
                     elif data[5] == 1 and not self.is_running and not self.is_sending_params:
-                        all_running = all(
-                            c.get('system_status', 0) == 1
+                        active_statuses = [
+                            c.get('system_status', 0)
                             for c in self.mdd_feedback_cache.values()
-                        )
-                        if all_running and len(self.mdd_feedback_cache) > 0:
+                            if c.get('has_received_rx', False)
+                        ]
+                        if active_statuses and all(st == 1 for st in active_statuses):
                             self.is_running = True
-                            self.get_logger().info("すべてのMDDマイコンが制御実行中ステータス(1)であることを確認し、PC側の制御フラグを自動復帰しました。")
+                            self.get_logger().info("通信中のMDDマイコンがすべて制御実行中(1)であることを確認し、PC側の制御フラグを自動復帰しました。")
                     
                     self.publish_mdd_feedback(base_id)
 

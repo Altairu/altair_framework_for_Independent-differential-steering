@@ -1195,7 +1195,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (state.controlMode !== "CONTROL") {
       appendTerminalLog(el.behaviorTerminal, "[SYSTEM] マイコンが待機状態のため、自動的にパラメータを送信して制御を開始します...", "system-msg");
       try {
-        const paramRes = await fetch("/api/control/start", { method: "POST" });
+        const paramRes = await fetch("/api/start_control", { method: "POST" });
         const paramData = await paramRes.json();
         if (paramData.success) {
           appendTerminalLog(el.behaviorTerminal, `[SYSTEM] ${paramData.message}`, "system-msg");
